@@ -89,30 +89,39 @@ def lstm_torch_multi(
     return_model=False
 ):
     """
-    X_*_feat: (T, n_features)
-    y_*_vals: (T,)
+    使多因子模型和单因子模型风格一致：
+    - 训练：固定窗口 -> 下一日 close
+    - 测试：从 train 尾部取一个 window，滚动预测 test 段，
+            每一步用“真实的 test 特征”推进窗口（teacher forcing）
     """
+    assert horizon == 1, "当前实现只支持 horizon=1"
+
     n_features = X_train_feat.shape[1]
 
-    # 对全部数据做联合归一化
+    # ===== 1. 联合归一化 train+test =====
     all_feat = np.vstack([X_train_feat, X_test_feat])
     all_target = np.concatenate([y_train_vals, y_test_vals])
 
     scaler_X = MinMaxScaler()
     scaler_y = MinMaxScaler()
 
-    all_feat_scaled = scaler_X.fit_transform(all_feat)
-    all_target_scaled = scaler_y.fit_transform(all_target.reshape(-1, 1)).flatten()
+    feat_scaled = scaler_X.fit_transform(all_feat)
+    target_scaled = scaler_y.fit_transform(all_target.reshape(-1, 1)).flatten()
 
     train_len = len(X_train_feat)
-    X_train_scaled = all_feat_scaled[:train_len]
-    X_test_scaled = all_feat_scaled[train_len:]
-    y_train_scaled = all_target_scaled[:train_len]
-    y_test_scaled = all_target_scaled[train_len:]
+    X_train_scaled = feat_scaled[:train_len]
+    X_test_scaled = feat_scaled[train_len:]
+    y_train_scaled = target_scaled[:train_len]
+    y_test_scaled = target_scaled[train_len:]
 
-    # 构造监督学习数据
-    X_train_seq, y_train_seq = make_supervised_multi(X_train_scaled, y_train_scaled, window, horizon)
-    X_test_seq, y_test_seq = make_supervised_multi(X_test_scaled, y_test_scaled, window, horizon)
+    # ===== 2. 构造训练样本：滑动窗口 -> 下一天 =====
+    X_list, y_list = [], []
+    for i in range(len(y_train_scaled) - window):
+        X_list.append(X_train_scaled[i:i+window, :])   # (window, n_features)
+        y_list.append(y_train_scaled[i+window])        # 标的是第 window+1 天的 close
+
+    X_train_seq = np.array(X_list)                    # (N, window, n_features)
+    y_train_seq = np.array(y_list).reshape(-1, 1)     # (N, 1)
 
     X_train_t = torch.tensor(X_train_seq, dtype=torch.float32).to(device)
     y_train_t = torch.tensor(y_train_seq, dtype=torch.float32).to(device)
@@ -120,68 +129,97 @@ def lstm_torch_multi(
     dataset = TensorDataset(X_train_t, y_train_t)
     loader = DataLoader(dataset, batch_size=batch, shuffle=True)
 
-    model = LSTMPredictor(input_size=n_features, hidden_size=units, horizon=horizon).to(device)
+    # ===== 3. 定义模型 =====
+    model = LSTMPredictor(input_size=n_features, hidden_size=units, horizon=1).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
+    # ===== 4. 训练 =====
     model.train()
     for ep in range(epochs):
         epoch_loss = 0.0
         for xb, yb in loader:
             optimizer.zero_grad()
-            pred = model(xb)
+            pred = model(xb)          # (batch, 1)
             loss = criterion(pred, yb)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * xb.size(0)
         print(f"Epoch {ep+1}/{epochs} - loss: {epoch_loss/len(dataset):.6f}")
 
-    # 在 test 段滚动预测（仍然用真实特征 X_test_scaled 做输入）
+    # ===== 5. 在 test 段做“滚动预测”（与单因子风格一致）=====
     model.eval()
     preds_scaled = []
+
+    # 初始 history：取 train 段最后 window 天的特征
+    history_feat = list(X_train_scaled[-window:])   # 长度 = window
+
     with torch.no_grad():
-        for i in range(len(X_test_seq)):
-            x = torch.tensor(X_test_seq[i:i+1], dtype=torch.float32).to(device)
-            yhat_scaled = model(x).cpu().numpy().flatten()[0]
+        for t in range(len(X_test_scaled)):
+            # 用 history 中最近 window 天作为模型输入
+            x = np.array(history_feat[-window:]).reshape(1, window, n_features)
+            x_t = torch.tensor(x, dtype=torch.float32).to(device)
+            yhat_scaled = model(x_t).cpu().numpy().flatten()[0]
             preds_scaled.append(yhat_scaled)
 
-    preds_scaled = np.array(preds_scaled).reshape(-1, 1)
-    y_test_target = y_test_seq[:, 0]                      # 只看 horizon=1 的目标
+            # 用真实的 test 特征推进窗口（teacher forcing）
+            history_feat.append(X_test_scaled[t])
 
+    preds_scaled = np.array(preds_scaled).reshape(-1, 1)
+
+    # y_true：直接用原始尺度的 y_test_vals
     inv_preds = scaler_y.inverse_transform(preds_scaled).flatten()
-    inv_test = scaler_y.inverse_transform(y_test_target.reshape(-1,1)).flatten()
+    inv_test = y_test_vals[-len(inv_preds):]   # 对齐（正常情况长度相等）
 
     if return_model:
         return inv_test, inv_preds, model, scaler_X, scaler_y
     else:
         return inv_test, inv_preds
-
+    
 # ====== 用训练好的模型在其它股票上预测 ======
 def forecast_other_stock_multi(model, scaler_X, scaler_y, df_stock, window, horizon=1):
     """
     df_stock: 某一只股票的数据，index 为 date，包含 FEATURES 和 TARGET
+    使用在 AAPL 上训练好的多因子模型，在该股票上做滚动预测：
+    - 起始窗口：该股票前 window 天的真实特征
+    - 每一步：用 history 的 window 天特征预测下一日 close
+             然后用“真实特征”推进 history（teacher forcing）
     """
-    feat = df_stock[FEATURES].values.astype(float)
-    target = df_stock[TARGET].values.astype(float)
+    assert horizon == 1, "当前实现只支持 horizon=1"
 
+    feat = df_stock[FEATURES].values.astype(float)   # (T, n_features)
+    target = df_stock[TARGET].values.astype(float)   # (T,)
+
+    # 用训练时的 scaler 归一化
     feat_scaled = scaler_X.transform(feat)
-    target_scaled = scaler_y.transform(target.reshape(-1,1)).flatten()
+    target_scaled = scaler_y.transform(target.reshape(-1, 1)).flatten()
 
-    X_seq, y_seq = make_supervised_multi(feat_scaled, target_scaled, window, horizon)
-    X_t = torch.tensor(X_seq, dtype=torch.float32).to(device)
+    n_features = feat_scaled.shape[1]
+    T = len(feat_scaled)
+    if T <= window:
+        raise ValueError("该股票数据长度不足以构造窗口")
+
+    # 初始 history：前 window 天真实特征
+    history_feat = list(feat_scaled[:window])
+    preds_scaled = []
 
     model.eval()
-    preds_scaled = []
     with torch.no_grad():
-        for i in range(len(X_seq)):
-            yhat = model(X_t[i:i+1]).cpu().numpy().flatten()[0]
-            preds_scaled.append(yhat)
+        for t in range(window, T):
+            x = np.array(history_feat[-window:]).reshape(1, window, n_features)
+            x_t = torch.tensor(x, dtype=torch.float32).to(device)
+            yhat_scaled = model(x_t).cpu().numpy().flatten()[0]
+            preds_scaled.append(yhat_scaled)
 
-    preds_scaled = np.array(preds_scaled).reshape(-1,1)
-    y_true_scaled = y_seq[:,0]
+            # teacher forcing：用真实特征推进
+            history_feat.append(feat_scaled[t])
+
+    preds_scaled = np.array(preds_scaled).reshape(-1, 1)
+    # 真实 close（与预测对齐，从第 window+1 天开始）
+    y_true_scaled = target_scaled[window:]
 
     inv_preds = scaler_y.inverse_transform(preds_scaled).flatten()
-    inv_true = scaler_y.inverse_transform(y_true_scaled.reshape(-1,1)).flatten()
+    inv_true = scaler_y.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
     return inv_true, inv_preds
 
 def main(m):
